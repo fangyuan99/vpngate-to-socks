@@ -122,6 +122,60 @@ func TestSelectCandidatePrefersLowestUsersThenLowestUptimeThenLowestSessions(t *
 	}
 }
 
+func TestSelectCandidateHonorsPreferredCountry(t *testing.T) {
+	r := &Runner{
+		autoConfig: AutoPilotConfig{PreferredCountry: "JP"}.withDefaults(),
+		quarantine: make(map[string]nodeHealth),
+	}
+
+	servers := []vpngate.Server{
+		{HostName: "kr-best", IP: "1.1.1.1", CountryLong: "Korea Republic of", CountryShort: "KR", TotalUsers: 1, Uptime: 1, NumVPNSessions: 1, OpenVPNConfigDataBase64: "cfg1"},
+		{HostName: "jp-target", IP: "2.2.2.2", CountryLong: "Japan", CountryShort: "JP", TotalUsers: 5, Uptime: 1, NumVPNSessions: 1, OpenVPNConfigDataBase64: "cfg2"},
+	}
+
+	server, err := r.selectCandidate(servers)
+	if err != nil {
+		t.Fatalf("selectCandidate() error = %v", err)
+	}
+
+	if server.HostName != "jp-target" {
+		t.Fatalf("selectCandidate() host = %q, want %q", server.HostName, "jp-target")
+	}
+}
+
+func TestUpdateAutoReconnectClearsPauseAndUpdatesConfig(t *testing.T) {
+	r := &Runner{
+		logger:     log.New(&bytes.Buffer{}, "", 0),
+		socks:      &SOCKSServer{},
+		autoConfig: AutoPilotConfig{Enabled: true, MonitorInterval: 20 * time.Second}.withDefaults(),
+		autoPaused: true,
+		state:      StateDisconnected,
+		quarantine: make(map[string]nodeHealth),
+	}
+
+	status, err := r.UpdateAutoReconnect(AutoReconnectConfig{
+		Enabled:          true,
+		PreferredCountry: "jp",
+		MonitorInterval:  15 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("UpdateAutoReconnect() error = %v", err)
+	}
+
+	if !status.AutoReconnect.Enabled {
+		t.Fatal("status.AutoReconnect.Enabled = false, want true")
+	}
+	if status.AutoReconnect.Paused {
+		t.Fatal("status.AutoReconnect.Paused = true, want false")
+	}
+	if status.AutoReconnect.PreferredCountry != "JP" {
+		t.Fatalf("status.AutoReconnect.PreferredCountry = %q, want %q", status.AutoReconnect.PreferredCountry, "JP")
+	}
+	if status.AutoReconnect.MonitorIntervalSeconds != 15 {
+		t.Fatalf("status.AutoReconnect.MonitorIntervalSeconds = %d, want %d", status.AutoReconnect.MonitorIntervalSeconds, 15)
+	}
+}
+
 func TestRunMonitorCheckRequiresConsecutiveFailuresBeforeSwitch(t *testing.T) {
 	r := &Runner{
 		autoConfig: AutoPilotConfig{MonitorURL: "https://www.gstatic.com/generate_204", MonitorFailureThreshold: 3},

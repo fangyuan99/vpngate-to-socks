@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -9,8 +10,10 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"vpngate/internal/runner"
 	"vpngate/internal/runnerclient"
@@ -21,6 +24,59 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+type stubRunnerControl struct {
+	enabled             bool
+	status              func(context.Context) (runner.Status, error)
+	connect             func(context.Context, vpngate.Server) (runner.Status, error)
+	disconnect          func(context.Context) (runner.Status, error)
+	testServer          func(context.Context, vpngate.Server) (vpngate.OpenVPNTestResult, error)
+	updateAutoReconnect func(context.Context, runner.AutoReconnectConfig) (runner.Status, error)
+}
+
+func (s *stubRunnerControl) Enabled() bool {
+	return s != nil && s.enabled
+}
+
+func (s *stubRunnerControl) Status(ctx context.Context) (runner.Status, error) {
+	if s != nil && s.status != nil {
+		return s.status(ctx)
+	}
+
+	return runner.Status{}, nil
+}
+
+func (s *stubRunnerControl) Connect(ctx context.Context, server vpngate.Server) (runner.Status, error) {
+	if s != nil && s.connect != nil {
+		return s.connect(ctx, server)
+	}
+
+	return runner.Status{}, nil
+}
+
+func (s *stubRunnerControl) Disconnect(ctx context.Context) (runner.Status, error) {
+	if s != nil && s.disconnect != nil {
+		return s.disconnect(ctx)
+	}
+
+	return runner.Status{}, nil
+}
+
+func (s *stubRunnerControl) TestServer(ctx context.Context, server vpngate.Server) (vpngate.OpenVPNTestResult, error) {
+	if s != nil && s.testServer != nil {
+		return s.testServer(ctx, server)
+	}
+
+	return vpngate.OpenVPNTestResult{}, nil
+}
+
+func (s *stubRunnerControl) UpdateAutoReconnect(ctx context.Context, config runner.AutoReconnectConfig) (runner.Status, error) {
+	if s != nil && s.updateAutoReconnect != nil {
+		return s.updateAutoReconnect(ctx, config)
+	}
+
+	return runner.Status{}, nil
 }
 
 func TestSelectRecommendedServer(t *testing.T) {
@@ -39,6 +95,93 @@ func TestSelectRecommendedServer(t *testing.T) {
 
 	if server.HostName != "jp-best" {
 		t.Fatalf("selectRecommendedServer() host = %q, want %q", server.HostName, "jp-best")
+	}
+}
+
+func TestBuildPageDataSortsRowsByRequestedField(t *testing.T) {
+	app, err := NewApp(log.New(io.Discard, "", 0), nil, nil)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	app.mu.Lock()
+	app.servers = []vpngate.Server{
+		{HostName: "slow", IP: "1.1.1.1", CountryLong: "Japan", CountryShort: "JP", Speed: 100, TotalUsers: 10, Uptime: 10, NumVPNSessions: 10, OpenVPNConfigDataBase64: "cfg1"},
+		{HostName: "fast", IP: "2.2.2.2", CountryLong: "Japan", CountryShort: "JP", Speed: 500, TotalUsers: 5, Uptime: 5, NumVPNSessions: 5, OpenVPNConfigDataBase64: "cfg2"},
+		{HostName: "mid", IP: "3.3.3.3", CountryLong: "Japan", CountryShort: "JP", Speed: 300, TotalUsers: 8, Uptime: 8, NumVPNSessions: 8, OpenVPNConfigDataBase64: "cfg3"},
+	}
+	app.mu.Unlock()
+
+	page := app.buildPageData("", "", "", "", "speed", "desc")
+	if len(page.Rows) != 3 {
+		t.Fatalf("row count = %d, want 3", len(page.Rows))
+	}
+
+	if page.Rows[0].Name != "fast" || page.Rows[1].Name != "mid" || page.Rows[2].Name != "slow" {
+		t.Fatalf("sorted rows = [%s %s %s], want [fast mid slow]", page.Rows[0].Name, page.Rows[1].Name, page.Rows[2].Name)
+	}
+}
+
+func TestHandleAutoReconnectUpdatesRunnerConfig(t *testing.T) {
+	var received runner.AutoReconnectConfig
+	runnerStub := &stubRunnerControl{
+		enabled: true,
+		updateAutoReconnect: func(ctx context.Context, config runner.AutoReconnectConfig) (runner.Status, error) {
+			received = config
+			return runner.Status{
+				AutoReconnect: runner.AutoReconnectStatus{
+					Enabled:                true,
+					PreferredCountry:       "JP",
+					MonitorIntervalSeconds: 15,
+				},
+			}, nil
+		},
+	}
+
+	app, err := NewApp(log.New(io.Discard, "", 0), nil, runnerStub)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	form := url.Values{
+		"auto_reconnect_enabled": []string{"1"},
+		"auto_country":           []string{"JP"},
+		"auto_monitor_interval":  []string{"15"},
+		"q":                      []string{"japan"},
+		"country":                []string{"JP"},
+		"sort":                   []string{"speed"},
+		"order":                  []string{"desc"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/vpn/auto-reconnect", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("Accept", "application/json")
+
+	recorder := httptest.NewRecorder()
+	app.handleAutoReconnect(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("handleAutoReconnect() status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	if !received.Enabled {
+		t.Fatal("received.Enabled = false, want true")
+	}
+	if received.PreferredCountry != "JP" {
+		t.Fatalf("received.PreferredCountry = %q, want %q", received.PreferredCountry, "JP")
+	}
+	if received.MonitorInterval != 15*time.Second {
+		t.Fatalf("received.MonitorInterval = %s, want %s", received.MonitorInterval, 15*time.Second)
+	}
+
+	var response actionResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if !response.OK {
+		t.Fatalf("response.OK = false, error = %q", response.Error)
+	}
+	if !strings.Contains(response.Notice, "自动重连已启用") {
+		t.Fatalf("notice = %q, want substring %q", response.Notice, "自动重连已启用")
 	}
 }
 
@@ -242,6 +385,133 @@ func TestHandleVPNConnectRecommendedConnectsBestFilteredServer(t *testing.T) {
 	}
 	if !strings.Contains(response.Notice, "已开始连接推荐节点 jp-best") {
 		t.Fatalf("handleVPNConnectRecommended() notice = %q, want substring %q", response.Notice, "已开始连接推荐节点 jp-best")
+	}
+}
+
+func TestHandleServerTestAllowsConcurrentRequests(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var active atomic.Int32
+	var maxActive atomic.Int32
+
+	runnerStub := &stubRunnerControl{
+		enabled: true,
+		testServer: func(ctx context.Context, server vpngate.Server) (vpngate.OpenVPNTestResult, error) {
+			current := active.Add(1)
+			defer active.Add(-1)
+			updateMaxAtomic(&maxActive, current)
+
+			started <- server.HostName
+
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return vpngate.OpenVPNTestResult{}, ctx.Err()
+			}
+
+			return vpngate.OpenVPNTestResult{
+				Duration: 1500 * time.Millisecond,
+				Detail:   "握手成功",
+			}, nil
+		},
+	}
+
+	app, err := NewApp(log.New(io.Discard, "", 0), nil, runnerStub)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	app.mu.Lock()
+	app.servers = []vpngate.Server{
+		{HostName: "node-a", IP: "1.1.1.1"},
+		{HostName: "node-b", IP: "2.2.2.2"},
+	}
+	app.mu.Unlock()
+
+	type requestResult struct {
+		code int
+		body actionResponse
+	}
+
+	makeRequest := func(hostName, ip string) requestResult {
+		form := url.Values{
+			"hostname": []string{hostName},
+			"ip":       []string{ip},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/servers/test", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+		req.Header.Set("Accept", "application/json")
+
+		recorder := httptest.NewRecorder()
+		app.handleServerTest(recorder, req)
+
+		var response actionResponse
+		if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+			t.Fatalf("Decode() error = %v", err)
+		}
+
+		return requestResult{code: recorder.Code, body: response}
+	}
+
+	results := make(chan requestResult, 2)
+	var wg sync.WaitGroup
+	for _, server := range []vpngate.Server{
+		{HostName: "node-a", IP: "1.1.1.1"},
+		{HostName: "node-b", IP: "2.2.2.2"},
+	} {
+		wg.Add(1)
+		go func(server vpngate.Server) {
+			defer wg.Done()
+			results <- makeRequest(server.HostName, server.IP)
+		}(server)
+	}
+
+	waitForStarted := func() {
+		t.Helper()
+
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for concurrent test request to start")
+		}
+	}
+
+	waitForStarted()
+	waitForStarted()
+	close(release)
+
+	wg.Wait()
+	close(results)
+
+	if maxActive.Load() != 2 {
+		t.Fatalf("max concurrent tests = %d, want 2", maxActive.Load())
+	}
+
+	for result := range results {
+		if result.code != http.StatusOK {
+			t.Fatalf("handleServerTest() status = %d, want %d", result.code, http.StatusOK)
+		}
+		if !result.body.OK {
+			t.Fatalf("handleServerTest() response.OK = false, error = %q", result.body.Error)
+		}
+		if result.body.Test == nil {
+			t.Fatal("handleServerTest() response.Test = nil, want payload")
+		}
+		if result.body.Test.Status != "测试通过" {
+			t.Fatalf("handleServerTest() response.Test.Status = %q, want %q", result.body.Test.Status, "测试通过")
+		}
+	}
+}
+
+func updateMaxAtomic(target *atomic.Int32, value int32) {
+	for {
+		current := target.Load()
+		if value <= current {
+			return
+		}
+		if target.CompareAndSwap(current, value) {
+			return
+		}
 	}
 }
 

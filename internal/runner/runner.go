@@ -30,7 +30,7 @@ type Runner struct {
 	mu                      sync.RWMutex
 	autoConfig              AutoPilotConfig
 	httpClient              *http.Client
-	testing                 bool
+	activeTests             int
 	state                   State
 	current                 *ConnectionInfo
 	lastError               string
@@ -72,6 +72,8 @@ type bypassRouteSpec struct {
 	Direct    bool
 }
 
+var testServerWithOpenVPN = vpngate.TestServerWithOpenVPN
+
 func New(logger *log.Logger, socksListenAddr string, bypassCIDRs []string, autoConfig AutoPilotConfig) (*Runner, error) {
 	if logger == nil {
 		logger = log.Default()
@@ -100,10 +102,6 @@ func New(logger *log.Logger, socksListenAddr string, bypassCIDRs []string, autoC
 }
 
 func (r *Runner) Start(ctx context.Context) {
-	if !r.autoConfig.Enabled {
-		return
-	}
-
 	go r.autoLoop(ctx)
 }
 
@@ -126,16 +124,73 @@ func (r *Runner) Status() Status {
 	}
 
 	logs := append([]string(nil), r.logTail...)
+	socksListenAddr := ""
+	if r.socks != nil {
+		socksListenAddr = r.socks.ListenAddr()
+	}
 
 	return Status{
 		State:           r.state,
 		Current:         current,
-		SocksListenAddr: r.socks.ListenAddr(),
+		SocksListenAddr: socksListenAddr,
 		LastError:       r.lastError,
 		ConnectedAt:     r.connectedAt,
 		UpdatedAt:       r.updatedAt,
 		LogTail:         logs,
+		AutoReconnect: AutoReconnectStatus{
+			Enabled:                r.autoConfig.Enabled,
+			Paused:                 r.autoConfig.Enabled && r.autoPaused,
+			PreferredCountry:       r.autoConfig.PreferredCountry,
+			MonitorIntervalSeconds: int(r.autoConfig.MonitorInterval / time.Second),
+		},
 	}
+}
+
+func (r *Runner) UpdateAutoReconnect(config AutoReconnectConfig) (Status, error) {
+	if config.MonitorInterval > 0 && config.MonitorInterval < minMonitorInterval {
+		return r.Status(), fmt.Errorf("测活间隔不能小于 %s", minMonitorInterval.Round(time.Second))
+	}
+	if config.MonitorInterval > maxMonitorInterval {
+		return r.Status(), fmt.Errorf("测活间隔不能大于 %s", maxMonitorInterval.Round(time.Second))
+	}
+
+	r.mu.Lock()
+	currentConfig := r.autoConfig
+	currentState := r.state
+	hasProcess := r.proc != nil
+	activeTests := r.activeTests
+	r.mu.Unlock()
+
+	nextConfig := currentConfig
+	nextConfig.Enabled = config.Enabled
+	nextConfig.PreferredCountry = normalizePreferredCountry(config.PreferredCountry)
+	if config.MonitorInterval > 0 {
+		nextConfig.MonitorInterval = config.MonitorInterval
+	}
+	nextConfig = nextConfig.withDefaults()
+
+	r.mu.Lock()
+	intervalChanged := r.autoConfig.MonitorInterval != nextConfig.MonitorInterval
+	enabledChanged := r.autoConfig.Enabled != nextConfig.Enabled
+	r.autoConfig = nextConfig
+	r.autoPaused = false
+	r.updatedAt = time.Now()
+	r.mu.Unlock()
+
+	if !nextConfig.Enabled {
+		r.stopMonitorLoop()
+		return r.Status(), nil
+	}
+
+	if currentState == StateConnected && (intervalChanged || enabledChanged) {
+		r.startMonitorLoop()
+	}
+
+	if currentState != StateConnecting && currentState != StateConnected && currentState != StateDisconnecting && !hasProcess && activeTests == 0 {
+		go r.runAutoStep(context.Background())
+	}
+
+	return r.Status(), nil
 }
 
 func (r *Runner) Connect(server vpngate.Server) error {
@@ -147,13 +202,13 @@ func (r *Runner) Connect(server vpngate.Server) error {
 	}
 
 	r.mu.Lock()
-	if r.testing || r.proc != nil || r.state == StateConnecting || r.state == StateConnected || r.state == StateDisconnecting {
+	if r.activeTests > 0 || r.proc != nil || r.state == StateConnecting || r.state == StateConnected || r.state == StateDisconnecting {
 		currentHost := "当前节点"
 		if r.current != nil && strings.TrimSpace(r.current.HostName) != "" {
 			currentHost = r.current.HostName
 		}
-		if r.testing {
-			currentHost = "测试流程"
+		if r.activeTests > 0 {
+			currentHost = "节点测试流程"
 		}
 		r.mu.Unlock()
 		return fmt.Errorf("当前已有活跃连接流程，请先断开节点 %s", currentHost)
@@ -284,7 +339,7 @@ func (r *Runner) Disconnect() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.testing {
+	if r.activeTests > 0 {
 		return fmt.Errorf("当前正在进行节点测试，请等待测试结束后再断开连接")
 	}
 
@@ -335,24 +390,23 @@ func (r *Runner) canProxy() bool {
 
 func (r *Runner) TestServer(ctx context.Context, server vpngate.Server) (vpngate.OpenVPNTestResult, error) {
 	r.mu.Lock()
-	if r.testing || r.proc != nil || r.state == StateConnecting || r.state == StateConnected || r.state == StateDisconnecting {
+	if r.proc != nil || r.state == StateConnecting || r.state == StateConnected || r.state == StateDisconnecting {
 		currentHost := "当前节点"
 		if r.current != nil && strings.TrimSpace(r.current.HostName) != "" {
 			currentHost = r.current.HostName
-		}
-		if r.testing {
-			currentHost = "测试流程"
 		}
 		r.mu.Unlock()
 		return vpngate.OpenVPNTestResult{}, fmt.Errorf("当前已有活跃连接流程，请先结束 %s 后再测试其他节点", currentHost)
 	}
 
-	r.testing = true
+	r.activeTests++
 	r.updatedAt = time.Now()
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
-		r.testing = false
+		if r.activeTests > 0 {
+			r.activeTests--
+		}
 		r.updatedAt = time.Now()
 		r.mu.Unlock()
 	}()
@@ -364,7 +418,7 @@ func (r *Runner) TestServer(ctx context.Context, server vpngate.Server) (vpngate
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	result, err := vpngate.TestServerWithOpenVPN(ctx, server)
+	result, err := testServerWithOpenVPN(ctx, server)
 	if err != nil {
 		r.logger.Printf("Runner 测试节点失败：%s（%s）：%v", server.HostName, server.IP, err)
 		return vpngate.OpenVPNTestResult{}, err

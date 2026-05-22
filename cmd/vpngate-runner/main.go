@@ -94,6 +94,7 @@ func socksBypassCIDRs() []string {
 func autoPilotConfig() runner.AutoPilotConfig {
 	return runner.AutoPilotConfig{
 		Enabled:                 envBool("AUTO_CONNECT", true),
+		PreferredCountry:        envString("AUTO_CONNECT_COUNTRY", ""),
 		MonitorURL:              envString("MONITOR_URL", "https://www.gstatic.com/generate_204"),
 		MonitorFailureThreshold: envInt("MONITOR_FAILURE_THRESHOLD", 3),
 		TCPProbeAddress:         envString("TCP_PROBE_ADDRESS", ""),

@@ -21,10 +21,13 @@ const (
 	linuxSocketMarkOption          = 36
 	fullMonitorConfirmTTL          = time.Minute
 	defaultMonitorFailureThreshold = 3
+	minMonitorInterval             = 5 * time.Second
+	maxMonitorInterval             = 10 * time.Minute
 )
 
 type AutoPilotConfig struct {
 	Enabled                 bool
+	PreferredCountry        string
 	MonitorURL              string
 	MonitorFailureThreshold int
 	TCPProbeAddress         string
@@ -47,6 +50,7 @@ type nodeHealth struct {
 }
 
 func (c AutoPilotConfig) withDefaults() AutoPilotConfig {
+	c.PreferredCountry = normalizePreferredCountry(c.PreferredCountry)
 	if strings.TrimSpace(c.MonitorURL) == "" {
 		c.MonitorURL = "https://www.gstatic.com/generate_204"
 	}
@@ -61,6 +65,12 @@ func (c AutoPilotConfig) withDefaults() AutoPilotConfig {
 	}
 	if c.MonitorInterval <= 0 {
 		c.MonitorInterval = 20 * time.Second
+	}
+	if c.MonitorInterval < minMonitorInterval {
+		c.MonitorInterval = minMonitorInterval
+	}
+	if c.MonitorInterval > maxMonitorInterval {
+		c.MonitorInterval = maxMonitorInterval
 	}
 	if c.MonitorTimeout <= 0 {
 		c.MonitorTimeout = 6 * time.Second
@@ -106,7 +116,7 @@ func (r *Runner) autoLoop(ctx context.Context) {
 
 func (r *Runner) runAutoStep(ctx context.Context) {
 	r.mu.RLock()
-	if r.autoPaused || !r.autoConfig.Enabled || r.testing || r.proc != nil || r.state == StateConnecting || r.state == StateConnected || r.state == StateDisconnecting {
+	if r.autoPaused || !r.autoConfig.Enabled || r.activeTests > 0 || r.proc != nil || r.state == StateConnecting || r.state == StateConnected || r.state == StateDisconnecting {
 		r.mu.RUnlock()
 		return
 	}
@@ -152,10 +162,14 @@ func (r *Runner) selectCandidate(servers []vpngate.Server) (vpngate.Server, erro
 	r.mu.RLock()
 	quarantine := make(map[string]nodeHealth, len(r.quarantine))
 	maps.Copy(quarantine, r.quarantine)
+	preferredCountry := r.autoConfig.PreferredCountry
 	r.mu.RUnlock()
 
 	for _, server := range servers {
 		if !vpngate.IsRecommendedServer(server) {
+			continue
+		}
+		if !matchesPreferredCountry(server, preferredCountry) {
 			continue
 		}
 
@@ -168,12 +182,29 @@ func (r *Runner) selectCandidate(servers []vpngate.Server) (vpngate.Server, erro
 	}
 
 	if len(candidates) == 0 {
+		if preferredCountry != "" {
+			return vpngate.Server{}, fmt.Errorf("指定地区 %s 没有可用于自动连接的 VPN 节点", preferredCountry)
+		}
 		return vpngate.Server{}, fmt.Errorf("没有可用于自动连接的 VPN 节点")
 	}
 
 	vpngate.SortServersByRecommendation(candidates)
 
 	return candidates[0], nil
+}
+
+func normalizePreferredCountry(value string) string {
+	return strings.ToUpper(strings.TrimSpace(value))
+}
+
+func matchesPreferredCountry(server vpngate.Server, preferredCountry string) bool {
+	preferredCountry = normalizePreferredCountry(preferredCountry)
+	if preferredCountry == "" {
+		return true
+	}
+
+	return strings.EqualFold(strings.TrimSpace(server.CountryShort), preferredCountry) ||
+		strings.EqualFold(strings.TrimSpace(server.CountryLong), preferredCountry)
 }
 
 func (r *Runner) prepareMonitorTargets() error {

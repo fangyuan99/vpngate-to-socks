@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"vpngate/internal/runner"
 	"vpngate/internal/vpngate"
@@ -30,6 +31,12 @@ type connectResponse struct {
 type testResponse struct {
 	Result vpngate.OpenVPNTestResult `json:"result"`
 	Error  string                    `json:"error,omitempty"`
+}
+
+type autoReconnectRequest struct {
+	Enabled                bool   `json:"enabled"`
+	PreferredCountry       string `json:"preferredCountry"`
+	MonitorIntervalSeconds int    `json:"monitorIntervalSeconds"`
 }
 
 func New(baseURL string, httpClient *http.Client) *Client {
@@ -145,6 +152,29 @@ func (c *Client) TestServer(ctx context.Context, server vpngate.Server) (vpngate
 	}
 
 	return payload.Result, nil
+}
+
+func (c *Client) UpdateAutoReconnect(ctx context.Context, config runner.AutoReconnectConfig) (runner.Status, error) {
+	if !c.Enabled() {
+		return runner.Status{}, fmt.Errorf("Runner 控制接口未配置")
+	}
+
+	body, err := json.Marshal(autoReconnectRequest{
+		Enabled:                config.Enabled,
+		PreferredCountry:       config.PreferredCountry,
+		MonitorIntervalSeconds: int(config.MonitorInterval / time.Second),
+	})
+	if err != nil {
+		return runner.Status{}, fmt.Errorf("序列化自动重连配置失败: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/autopilot", bytes.NewReader(body))
+	if err != nil {
+		return runner.Status{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	return c.doConnectRequest(req)
 }
 
 func (c *Client) doConnectRequest(req *http.Request) (runner.Status, error) {

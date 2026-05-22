@@ -1,6 +1,6 @@
 # VpnGate
 
-一个本地 VPN Gate 管理工具：提供 **节点浏览 Web 页面**、**单节点 OpenVPN 测试**、**推荐节点连接**、**自动连接/监测 Runner** 和 **SOCKS5 代理出口**。
+一个本地 VPN Gate 管理工具：提供 **节点浏览 Web 页面**、**多节点并发 OpenVPN 测试**、**推荐节点连接**、**自动连接/监测 Runner** 和 **SOCKS5 代理出口**。
 
 适合用来：
 
@@ -16,7 +16,7 @@
 - 按推荐规则排序节点（综合 Score / Speed / Ping 等因素）
 - 按关键词、国家筛选节点
 - 展示节点主机名、IP、国家、Ping、速度、在线时长、会话数、用户数、流量、备注等信息
-- 支持单节点 OpenVPN 测试
+- 支持多个节点并发 OpenVPN 测试
 - 支持连接推荐节点 / 指定节点 / 断开连接
 - 提供本地 SOCKS5 代理入口
 - 支持 Runner 自动连接、监控探活、失败隔离与重试
@@ -259,7 +259,7 @@ AUTO_CONNECT=false MONITOR_INTERVAL=15s docker compose -f docker-compose.macos.y
 
 - 节点数据来自上游 VPN Gate API：`https://www.vpngate.net/api/iphone/`
 - 首次启动时会自动刷新一次节点列表；如果失败，服务仍会继续启动
-- 单节点测试和持久连接依赖 `openvpn`
+- 节点测试和持久连接依赖 `openvpn`
 - Docker 场景下，Runner 需要 `privileged` / `NET_ADMIN` 等网络能力
 - macOS Docker Desktop 场景依赖 Linux VM 的网络能力，不等同于直接控制 macOS 宿主机网络
 - 如果你只需要查看节点列表，可以只运行 Web；如果需要连接、SOCKS5、自动守护能力，则需要同时运行 Runner

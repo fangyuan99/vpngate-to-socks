@@ -24,6 +24,12 @@ type testResponse struct {
 	Error  string                    `json:"error,omitempty"`
 }
 
+type autoReconnectRequest struct {
+	Enabled                bool   `json:"enabled"`
+	PreferredCountry       string `json:"preferredCountry"`
+	MonitorIntervalSeconds int    `json:"monitorIntervalSeconds"`
+}
+
 func NewAPIHandler(logger *log.Logger, runner *Runner) http.Handler {
 	if logger == nil {
 		logger = log.Default()
@@ -122,6 +128,32 @@ func NewAPIHandler(logger *log.Logger, runner *Runner) http.Handler {
 
 		logger.Println("控制接口已接受断开连接请求")
 		writeJSON(w, http.StatusOK, connectResponse{Status: runner.Status()})
+	})
+
+	mux.HandleFunc("/autopilot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "仅支持 POST 请求", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req autoReconnectRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, connectResponse{Status: runner.Status(), Error: "读取自动重连配置失败"})
+			return
+		}
+
+		status, err := runner.UpdateAutoReconnect(AutoReconnectConfig{
+			Enabled:          req.Enabled,
+			PreferredCountry: req.PreferredCountry,
+			MonitorInterval:  time.Duration(req.MonitorIntervalSeconds) * time.Second,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, connectResponse{Status: status, Error: err.Error()})
+			return
+		}
+
+		logger.Printf("控制接口已更新自动重连配置：enabled=%t preferredCountry=%s monitorInterval=%ds", req.Enabled, req.PreferredCountry, req.MonitorIntervalSeconds)
+		writeJSON(w, http.StatusOK, connectResponse{Status: status})
 	})
 
 	return loggingMiddleware(logger, mux)

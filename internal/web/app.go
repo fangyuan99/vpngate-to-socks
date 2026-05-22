@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +36,6 @@ type App struct {
 	lastRefreshDuration time.Duration
 	lastError           string
 	testResults         map[string]serverTestState
-	testSlot            chan struct{}
 }
 
 type RunnerControl interface {
@@ -44,40 +44,50 @@ type RunnerControl interface {
 	Connect(ctx context.Context, server vpngate.Server) (runner.Status, error)
 	Disconnect(ctx context.Context) (runner.Status, error)
 	TestServer(ctx context.Context, server vpngate.Server) (vpngate.OpenVPNTestResult, error)
+	UpdateAutoReconnect(ctx context.Context, config runner.AutoReconnectConfig) (runner.Status, error)
 }
 
 type PageData struct {
-	Title               string
-	Description         string
-	StatusText          string
-	StatusClass         string
-	Notice              string
-	FlashError          string
-	Error               string
-	Query               string
-	SelectedCountry     string
-	Countries           []CountryOption
-	UpdatedAt           string
-	RefreshDuration     string
-	TotalCount          int
-	SourceCount         int
-	CountryCount        int
-	AveragePing         string
-	HighestSpeed        string
-	Rows                []ServerRow
-	CurrentYear         int
-	SupportsRefresh     bool
-	SupportsVPNControl  bool
-	HasData             bool
-	LastUpdatedReadable string
-	VPNStatusText       string
-	VPNStatusClass      string
-	VPNStatusDetail     string
-	VPNSocksAddress     string
-	VPNCurrentNode      string
-	VPNCurrentIP        string
-	VPNConnectedSince   string
-	VPNCanDisconnect    bool
+	Title                        string
+	Description                  string
+	StatusText                   string
+	StatusClass                  string
+	Notice                       string
+	FlashError                   string
+	Error                        string
+	Query                        string
+	SelectedCountry              string
+	SortField                    string
+	SortOrder                    string
+	Countries                    []CountryOption
+	UpdatedAt                    string
+	RefreshDuration              string
+	TotalCount                   int
+	SourceCount                  int
+	CountryCount                 int
+	AveragePing                  string
+	HighestSpeed                 string
+	Rows                         []ServerRow
+	CurrentYear                  int
+	SupportsRefresh              bool
+	SupportsVPNControl           bool
+	HasData                      bool
+	LastUpdatedReadable          string
+	VPNStatusText                string
+	VPNStatusClass               string
+	VPNStatusDetail              string
+	VPNSocksAddress              string
+	VPNCurrentNode               string
+	VPNCurrentIP                 string
+	VPNConnectedSince            string
+	VPNCanDisconnect             bool
+	AutoReconnectEnabled         bool
+	AutoReconnectPaused          bool
+	AutoReconnectCountry         string
+	AutoReconnectIntervalSeconds int
+	AutoReconnectStatusText      string
+	AutoReconnectStatusClass     string
+	AutoReconnectStatusDetail    string
 }
 
 type CountryOption struct {
@@ -162,7 +172,6 @@ func NewApp(logger *log.Logger, client *http.Client, runnerClient RunnerControl)
 		tmpl:        tmpl,
 		runner:      runnerClient,
 		testResults: make(map[string]serverTestState),
-		testSlot:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -174,6 +183,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("/vpn/connect/recommended", a.handleVPNConnectRecommended)
 	mux.HandleFunc("/vpn/connect", a.handleVPNConnect)
 	mux.HandleFunc("/vpn/disconnect", a.handleVPNDisconnect)
+	mux.HandleFunc("/vpn/auto-reconnect", a.handleAutoReconnect)
 	mux.HandleFunc("/vpn/status", a.handleVPNStatus)
 	mux.HandleFunc("/health", a.handleHealth)
 
@@ -231,6 +241,8 @@ func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("error"),
 		r.URL.Query().Get("q"),
 		r.URL.Query().Get("country"),
+		r.URL.Query().Get("sort"),
+		r.URL.Query().Get("order"),
 	)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -254,6 +266,11 @@ func (a *App) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
+	query := strings.TrimSpace(r.FormValue("q"))
+	selectedCountry := strings.TrimSpace(r.FormValue("country"))
+	sortField := strings.TrimSpace(r.FormValue("sort"))
+	sortOrder := strings.TrimSpace(r.FormValue("order"))
+
 	notice := "节点数据已刷新"
 	flashError := ""
 	if err := a.Refresh(ctx); err != nil {
@@ -271,7 +288,7 @@ func (a *App) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, buildIndexURL(notice, flashError, "", ""), http.StatusSeeOther)
+	http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
 }
 
 func (a *App) handleServerTest(w http.ResponseWriter, r *http.Request) {
@@ -294,9 +311,11 @@ func (a *App) handleServerTest(w http.ResponseWriter, r *http.Request) {
 	ip := strings.TrimSpace(r.FormValue("ip"))
 	query := strings.TrimSpace(r.FormValue("q"))
 	selectedCountry := strings.TrimSpace(r.FormValue("country"))
+	sortField := strings.TrimSpace(r.FormValue("sort"))
+	sortOrder := strings.TrimSpace(r.FormValue("order"))
 
 	redirectToIndex := func(notice, flashError string) {
-		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry), http.StatusSeeOther)
+		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
 	}
 
 	respondTestAction := func(statusCode int, ok bool, notice, flashError string, server *vpngate.Server, state *serverTestState) {
@@ -320,16 +339,6 @@ func (a *App) handleServerTest(w http.ResponseWriter, r *http.Request) {
 	server, ok := a.findServer(hostName, ip)
 	if !ok {
 		respondTestAction(http.StatusNotFound, false, "", "未找到对应节点，请先刷新列表后再试", nil, nil)
-		return
-	}
-
-	select {
-	case a.testSlot <- struct{}{}:
-		defer func() {
-			<-a.testSlot
-		}()
-	default:
-		respondTestAction(http.StatusConflict, false, "", "已有节点正在进行 OpenVPN 测试，请等待当前测试结束后再试", &server, nil)
 		return
 	}
 
@@ -405,6 +414,8 @@ func (a *App) handleVPNConnect(w http.ResponseWriter, r *http.Request) {
 
 	query := strings.TrimSpace(r.FormValue("q"))
 	selectedCountry := strings.TrimSpace(r.FormValue("country"))
+	sortField := strings.TrimSpace(r.FormValue("sort"))
+	sortOrder := strings.TrimSpace(r.FormValue("order"))
 	hostName := strings.TrimSpace(r.FormValue("hostname"))
 	ip := strings.TrimSpace(r.FormValue("ip"))
 
@@ -414,7 +425,7 @@ func (a *App) handleVPNConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry), http.StatusSeeOther)
+		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
 	}
 
 	if a.runner == nil || !a.runner.Enabled() {
@@ -484,6 +495,8 @@ func (a *App) handleVPNConnectRecommended(w http.ResponseWriter, r *http.Request
 
 	query := strings.TrimSpace(r.FormValue("q"))
 	selectedCountry := strings.TrimSpace(r.FormValue("country"))
+	sortField := strings.TrimSpace(r.FormValue("sort"))
+	sortOrder := strings.TrimSpace(r.FormValue("order"))
 
 	respond := func(statusCode int, ok bool, notice, flashError string) {
 		if wantsJSONResponse(r) {
@@ -491,7 +504,7 @@ func (a *App) handleVPNConnectRecommended(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry), http.StatusSeeOther)
+		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
 	}
 
 	if a.runner == nil || !a.runner.Enabled() {
@@ -555,7 +568,11 @@ func (a *App) handleVPNDisconnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		http.Redirect(w, r, buildIndexURL(notice, flashError, "", ""), http.StatusSeeOther)
+		query := strings.TrimSpace(r.FormValue("q"))
+		selectedCountry := strings.TrimSpace(r.FormValue("country"))
+		sortField := strings.TrimSpace(r.FormValue("sort"))
+		sortOrder := strings.TrimSpace(r.FormValue("order"))
+		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
 	}
 
 	if a.runner == nil || !a.runner.Enabled() {
@@ -573,6 +590,76 @@ func (a *App) handleVPNDisconnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respond(http.StatusOK, true, "已发送断开连接请求", "")
+}
+
+func (a *App) handleAutoReconnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.writeActionError(w, r, http.StatusMethodNotAllowed, "仅支持 POST 请求")
+		return
+	}
+
+	if err := validateSameOriginRequest(r); err != nil {
+		a.writeActionError(w, r, http.StatusForbidden, err.Error())
+		return
+	}
+
+	if err := parseSubmittedForm(r); err != nil {
+		a.writeActionError(w, r, http.StatusBadRequest, "读取表单失败")
+		return
+	}
+
+	query := strings.TrimSpace(r.FormValue("q"))
+	selectedCountry := strings.TrimSpace(r.FormValue("country"))
+	sortField := strings.TrimSpace(r.FormValue("sort"))
+	sortOrder := strings.TrimSpace(r.FormValue("order"))
+	enabled := r.FormValue("auto_reconnect_enabled") != ""
+	preferredCountry := strings.TrimSpace(r.FormValue("auto_country"))
+	intervalText := strings.TrimSpace(r.FormValue("auto_monitor_interval"))
+
+	respond := func(statusCode int, ok bool, notice, flashError string) {
+		if wantsJSONResponse(r) {
+			a.writeJSON(w, statusCode, actionResponse{OK: ok, Notice: notice, Error: flashError, Reload: ok})
+			return
+		}
+
+		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
+	}
+
+	if a.runner == nil || !a.runner.Enabled() {
+		respond(http.StatusServiceUnavailable, false, "", "VPN Runner 未配置，暂时无法更新自动重连设置")
+		return
+	}
+
+	monitorIntervalSeconds, err := strconv.Atoi(intervalText)
+	if err != nil || monitorIntervalSeconds <= 0 {
+		respond(http.StatusBadRequest, false, "", "测活间隔必须是大于 0 的整数秒")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	status, err := a.runner.UpdateAutoReconnect(ctx, runner.AutoReconnectConfig{
+		Enabled:          enabled,
+		PreferredCountry: preferredCountry,
+		MonitorInterval:  time.Duration(monitorIntervalSeconds) * time.Second,
+	})
+	if err != nil {
+		respond(http.StatusBadRequest, false, "", fmt.Sprintf("更新自动重连设置失败：%v", err))
+		return
+	}
+
+	regionLabel := "全部地区"
+	if strings.TrimSpace(status.AutoReconnect.PreferredCountry) != "" {
+		regionLabel = status.AutoReconnect.PreferredCountry
+	}
+
+	if !status.AutoReconnect.Enabled {
+		respond(http.StatusOK, true, "自动重连已关闭", "")
+		return
+	}
+
+	respond(http.StatusOK, true, fmt.Sprintf("自动重连已启用：地区 %s，测活间隔 %d 秒", regionLabel, status.AutoReconnect.MonitorIntervalSeconds), "")
 }
 
 func (a *App) handleVPNStatus(w http.ResponseWriter, r *http.Request) {
@@ -609,9 +696,10 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"状态":"正常"}`))
 }
 
-func (a *App) buildPageData(notice, flashError, query, selectedCountry string) PageData {
+func (a *App) buildPageData(notice, flashError, query, selectedCountry, sortField, sortOrder string) PageData {
 	runnerStatus, runnerErr := a.fetchRunnerStatus()
 	vpnStatusText, vpnStatusClass, vpnStatusDetail, vpnCurrentNode, vpnCurrentIP, vpnConnectedSince, vpnCanDisconnect := formatVPNStatus(runnerStatus, runnerErr)
+	autoReconnectText, autoReconnectClass, autoReconnectDetail := formatAutoReconnectStatus(runnerStatus, runnerErr)
 
 	a.mu.RLock()
 	servers := append([]vpngate.Server(nil), a.servers...)
@@ -631,6 +719,8 @@ func (a *App) buildPageData(notice, flashError, query, selectedCountry string) P
 
 	normalizedQuery := strings.ToLower(strings.TrimSpace(query))
 	normalizedCountry := strings.TrimSpace(selectedCountry)
+	normalizedSortField := normalizeSortField(sortField)
+	normalizedSortOrder := normalizeSortOrder(sortOrder)
 
 	for _, server := range servers {
 		countries[server.CountryLong] = struct{}{}
@@ -647,11 +737,23 @@ func (a *App) buildPageData(notice, flashError, query, selectedCountry string) P
 		return countryOptions[i].Label < countryOptions[j].Label
 	})
 
-	for _, server := range servers {
-		if !matchesFilters(server, normalizedQuery, normalizedCountry) {
-			continue
+	currentAutoCountry := strings.TrimSpace(runnerStatus.AutoReconnect.PreferredCountry)
+	if currentAutoCountry != "" {
+		if _, ok := countryLabels[currentAutoCountry]; !ok {
+			countryOptions = append(countryOptions, CountryOption{
+				Value: currentAutoCountry,
+				Label: currentAutoCountry,
+			})
+			sort.Slice(countryOptions, func(i, j int) bool {
+				return countryOptions[i].Label < countryOptions[j].Label
+			})
 		}
+	}
 
+	filteredServers := filterServers(servers, normalizedQuery, normalizedCountry)
+	sortFilteredServers(filteredServers, normalizedSortField, normalizedSortOrder)
+
+	for _, server := range filteredServers {
 		rank := len(rows) + 1
 		if server.Ping > 0 {
 			totalPing += server.Ping
@@ -708,37 +810,46 @@ func (a *App) buildPageData(notice, flashError, query, selectedCountry string) P
 	}
 
 	return PageData{
-		Title:               "VPNGate 节点管理页面",
-		Description:         "用于浏览当前可用的 VPNGate 在线节点，并支持按关键词与国家快速筛选。你现在还可以针对单个节点发起 OpenVPN 测试；测试会在当前服务所在主机上执行，成功握手后自动断开，不再提供一键全测。请确保宿主机已安装 openvpn，并具备创建网络接口所需权限。",
-		StatusText:          statusText,
-		StatusClass:         statusClass,
-		Notice:              notice,
-		FlashError:          flashError,
-		Error:               lastError,
-		Query:               query,
-		SelectedCountry:     selectedCountry,
-		Countries:           countryOptions,
-		UpdatedAt:           updatedAt,
-		RefreshDuration:     formatDurationCN(lastRefreshDuration),
-		TotalCount:          len(rows),
-		SourceCount:         len(servers),
-		CountryCount:        len(countries),
-		AveragePing:         averagePing,
-		HighestSpeed:        formatBitRate(highestSpeed),
-		Rows:                rows,
-		CurrentYear:         time.Now().Year(),
-		SupportsRefresh:     true,
-		SupportsVPNControl:  a.runner != nil && a.runner.Enabled(),
-		HasData:             len(rows) > 0,
-		LastUpdatedReadable: lastUpdatedReadable,
-		VPNStatusText:       vpnStatusText,
-		VPNStatusClass:      vpnStatusClass,
-		VPNStatusDetail:     vpnStatusDetail,
-		VPNSocksAddress:     runnerStatus.SocksListenAddr,
-		VPNCurrentNode:      vpnCurrentNode,
-		VPNCurrentIP:        vpnCurrentIP,
-		VPNConnectedSince:   vpnConnectedSince,
-		VPNCanDisconnect:    vpnCanDisconnect,
+		Title:                        "VPNGate 节点管理页面",
+		Description:                  "用于浏览当前可用的 VPNGate 在线节点，支持按关键词、国家和字段排序快速筛选。你现在还可以对多个节点并发发起 OpenVPN 测试，并为 Runner 配置指定地区的自动重连；测试会在当前服务所在主机上执行，成功握手后自动断开。请确保宿主机已安装 openvpn，并具备创建网络接口所需权限。",
+		StatusText:                   statusText,
+		StatusClass:                  statusClass,
+		Notice:                       notice,
+		FlashError:                   flashError,
+		Error:                        lastError,
+		Query:                        query,
+		SelectedCountry:              selectedCountry,
+		SortField:                    normalizedSortField,
+		SortOrder:                    normalizedSortOrder,
+		Countries:                    countryOptions,
+		UpdatedAt:                    updatedAt,
+		RefreshDuration:              formatDurationCN(lastRefreshDuration),
+		TotalCount:                   len(rows),
+		SourceCount:                  len(servers),
+		CountryCount:                 len(countries),
+		AveragePing:                  averagePing,
+		HighestSpeed:                 formatBitRate(highestSpeed),
+		Rows:                         rows,
+		CurrentYear:                  time.Now().Year(),
+		SupportsRefresh:              true,
+		SupportsVPNControl:           a.runner != nil && a.runner.Enabled(),
+		HasData:                      len(rows) > 0,
+		LastUpdatedReadable:          lastUpdatedReadable,
+		VPNStatusText:                vpnStatusText,
+		VPNStatusClass:               vpnStatusClass,
+		VPNStatusDetail:              vpnStatusDetail,
+		VPNSocksAddress:              runnerStatus.SocksListenAddr,
+		VPNCurrentNode:               vpnCurrentNode,
+		VPNCurrentIP:                 vpnCurrentIP,
+		VPNConnectedSince:            vpnConnectedSince,
+		VPNCanDisconnect:             vpnCanDisconnect,
+		AutoReconnectEnabled:         runnerStatus.AutoReconnect.Enabled,
+		AutoReconnectPaused:          runnerStatus.AutoReconnect.Paused,
+		AutoReconnectCountry:         currentAutoCountry,
+		AutoReconnectIntervalSeconds: defaultAutoReconnectIntervalSeconds(runnerStatus.AutoReconnect.MonitorIntervalSeconds),
+		AutoReconnectStatusText:      autoReconnectText,
+		AutoReconnectStatusClass:     autoReconnectClass,
+		AutoReconnectStatusDetail:    autoReconnectDetail,
 	}
 }
 
@@ -819,7 +930,7 @@ func (a *App) fetchRunnerStatus() (runner.Status, error) {
 	return a.runner.Status(ctx)
 }
 
-func buildIndexURL(notice, flashError, query, selectedCountry string) string {
+func buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder string) string {
 	values := url.Values{}
 	if strings.TrimSpace(notice) != "" {
 		values.Set("notice", notice)
@@ -832,6 +943,10 @@ func buildIndexURL(notice, flashError, query, selectedCountry string) string {
 	}
 	if strings.TrimSpace(selectedCountry) != "" {
 		values.Set("country", selectedCountry)
+	}
+	if normalizedSortField := normalizeSortField(sortField); normalizedSortField != sortFieldRecommended || normalizeSortOrder(sortOrder) != sortOrderAsc {
+		values.Set("sort", normalizedSortField)
+		values.Set("order", normalizeSortOrder(sortOrder))
 	}
 
 	if encoded := values.Encode(); encoded != "" {
@@ -898,7 +1013,7 @@ func formatServerTestState(state serverTestState) serverTestState {
 		return serverTestState{
 			Status:    "未测试",
 			ClassName: "test-idle",
-			Detail:    "可点击“测试节点”发起单节点 OpenVPN 测试",
+			Detail:    "可点击“测试节点”发起 OpenVPN 测试，支持多个节点同时测活",
 		}
 	}
 
@@ -976,6 +1091,46 @@ func buildServerTestPayload(server vpngate.Server, state serverTestState) *serve
 	}
 }
 
+const (
+	sortFieldRecommended                     = "recommended"
+	sortFieldName                            = "name"
+	sortFieldCountry                         = "country"
+	sortFieldPing                            = "ping"
+	sortFieldSpeed                           = "speed"
+	sortFieldSessions                        = "sessions"
+	sortFieldUptime                          = "uptime"
+	sortFieldUsers                           = "users"
+	sortFieldTraffic                         = "traffic"
+	sortFieldScore                           = "score"
+	sortFieldOperator                        = "operator"
+	sortOrderAsc                             = "asc"
+	sortOrderDesc                            = "desc"
+	defaultAutoReconnectIntervalSecondsValue = 20
+)
+
+func formatAutoReconnectStatus(status runner.Status, runnerErr error) (string, string, string) {
+	if runnerErr != nil {
+		return "自动重连不可用", "status-warn", runnerErr.Error()
+	}
+
+	region := "全部地区"
+	if strings.TrimSpace(status.AutoReconnect.PreferredCountry) != "" {
+		region = status.AutoReconnect.PreferredCountry
+	}
+	intervalSeconds := defaultAutoReconnectIntervalSeconds(status.AutoReconnect.MonitorIntervalSeconds)
+
+	if !status.AutoReconnect.Enabled {
+		return "自动重连已关闭", "status-warn", fmt.Sprintf("当前未接管断联恢复；开启后会按地区 %s、每 %d 秒测活一次。", region, intervalSeconds)
+	}
+
+	detail := fmt.Sprintf("地区：%s ｜ 测活间隔：%d 秒", region, intervalSeconds)
+	if status.AutoReconnect.Paused {
+		return "自动重连已暂停", "status-warn", detail + " ｜ 当前因手动断开连接而暂停，可重新保存设置恢复自动重连"
+	}
+
+	return "自动重连已启用", "status-ok", detail + " ｜ 断联后会自动选择当前范围内的最优节点重连"
+}
+
 func matchesFilters(server vpngate.Server, query, selectedCountry string) bool {
 	if selectedCountry != "" && !strings.EqualFold(server.CountryShort, selectedCountry) {
 		return false
@@ -995,6 +1150,204 @@ func matchesFilters(server vpngate.Server, query, selectedCountry string) bool {
 	}, " "))
 
 	return strings.Contains(searchable, query)
+}
+
+func filterServers(servers []vpngate.Server, query, selectedCountry string) []vpngate.Server {
+	filtered := make([]vpngate.Server, 0, len(servers))
+	for _, server := range servers {
+		if matchesFilters(server, query, selectedCountry) {
+			filtered = append(filtered, server)
+		}
+	}
+
+	return filtered
+}
+
+func normalizeSortField(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", sortFieldRecommended:
+		return sortFieldRecommended
+	case sortFieldName, sortFieldCountry, sortFieldPing, sortFieldSpeed, sortFieldSessions, sortFieldUptime, sortFieldUsers, sortFieldTraffic, sortFieldScore, sortFieldOperator:
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return sortFieldRecommended
+	}
+}
+
+func normalizeSortOrder(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), sortOrderDesc) {
+		return sortOrderDesc
+	}
+
+	return sortOrderAsc
+}
+
+func sortFilteredServers(servers []vpngate.Server, field, order string) {
+	field = normalizeSortField(field)
+	order = normalizeSortOrder(order)
+
+	if field == sortFieldRecommended {
+		vpngate.SortServersByRecommendation(servers)
+		if order == sortOrderDesc {
+			reverseServers(servers)
+		}
+		return
+	}
+
+	sort.SliceStable(servers, func(i, j int) bool {
+		cmp := compareServersByField(servers[i], servers[j], field)
+		if cmp == 0 {
+			cmp = compareServersByField(servers[i], servers[j], sortFieldRecommended)
+		}
+		if order == sortOrderDesc {
+			cmp = -cmp
+		}
+
+		return cmp < 0
+	})
+}
+
+func compareServersByField(left, right vpngate.Server, field string) int {
+	switch field {
+	case sortFieldName:
+		return compareText(left.HostName, right.HostName)
+	case sortFieldCountry:
+		if cmp := compareText(left.CountryLong, right.CountryLong); cmp != 0 {
+			return cmp
+		}
+		return compareText(left.CountryShort, right.CountryShort)
+	case sortFieldPing:
+		return compareOptionalInt(left.Ping, right.Ping)
+	case sortFieldSpeed:
+		return compareInt64(left.Speed, right.Speed)
+	case sortFieldSessions:
+		return compareInt64(left.NumVPNSessions, right.NumVPNSessions)
+	case sortFieldUptime:
+		return compareInt64(left.Uptime, right.Uptime)
+	case sortFieldUsers:
+		return compareInt64(left.TotalUsers, right.TotalUsers)
+	case sortFieldTraffic:
+		return compareInt64(left.TotalTraffic, right.TotalTraffic)
+	case sortFieldScore:
+		return compareInt64(left.Score, right.Score)
+	case sortFieldOperator:
+		return compareText(left.Operator, right.Operator)
+	default:
+		return compareRecommendedServers(left, right)
+	}
+}
+
+func compareRecommendedServers(left, right vpngate.Server) int {
+	if left.TotalUsers != right.TotalUsers {
+		return compareInt64(left.TotalUsers, right.TotalUsers)
+	}
+	if left.Uptime != right.Uptime {
+		return compareInt64(left.Uptime, right.Uptime)
+	}
+	if left.NumVPNSessions != right.NumVPNSessions {
+		return compareInt64(left.NumVPNSessions, right.NumVPNSessions)
+	}
+	if cmp := compareOptionalInt(left.Ping, right.Ping); cmp != 0 {
+		return cmp
+	}
+	if left.Score != right.Score {
+		switch {
+		case left.Score > right.Score:
+			return -1
+		case left.Score < right.Score:
+			return 1
+		}
+	}
+	if left.Speed != right.Speed {
+		switch {
+		case left.Speed > right.Speed:
+			return -1
+		case left.Speed < right.Speed:
+			return 1
+		}
+	}
+
+	if cmp := compareText(left.HostName, right.HostName); cmp != 0 {
+		return cmp
+	}
+
+	return compareText(left.IP, right.IP)
+}
+
+func compareText(left, right string) int {
+	left = strings.ToLower(strings.TrimSpace(left))
+	right = strings.ToLower(strings.TrimSpace(right))
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareOptionalInt(left, right int) int {
+	leftMissing := left <= 0
+	rightMissing := right <= 0
+	switch {
+	case leftMissing && rightMissing:
+		return 0
+	case leftMissing:
+		return 1
+	case rightMissing:
+		return -1
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareOptionalInt64(left, right int64) int {
+	leftMissing := left <= 0
+	rightMissing := right <= 0
+	switch {
+	case leftMissing && rightMissing:
+		return 0
+	case leftMissing:
+		return 1
+	case rightMissing:
+		return -1
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareInt64(left, right int64) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func reverseServers(servers []vpngate.Server) {
+	for left, right := 0, len(servers)-1; left < right; left, right = left+1, right-1 {
+		servers[left], servers[right] = servers[right], servers[left]
+	}
+}
+
+func defaultAutoReconnectIntervalSeconds(value int) int {
+	if value > 0 {
+		return value
+	}
+
+	return defaultAutoReconnectIntervalSecondsValue
 }
 
 func (a *App) loggingMiddleware(next http.Handler) http.Handler {
