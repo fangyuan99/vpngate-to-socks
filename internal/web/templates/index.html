@@ -726,6 +726,35 @@
         </div>
       </section>
 
+      <section class="card">
+        <div class="toolbar" style="margin-bottom: 0;">
+          <div>
+            <h2>自动刷新</h2>
+            <p>可让 Web 服务每天自动拉取一次最新节点列表，刷新不会断开当前 VPN 连接。</p>
+          </div>
+          <span class="status-pill {{.AutoRefreshStatusClass}}">{{.AutoRefreshStatusText}}</span>
+        </div>
+        <div class="subtext" style="margin-top: 10px; font-size: 13px;">{{.AutoRefreshStatusDetail}}</div>
+        <form class="settings-grid js-schedule-form" method="post" action="/refresh/schedule">
+          <input type="hidden" name="q" value="{{.Query}}">
+          <input type="hidden" name="country" value="{{.SelectedCountry}}">
+          <input type="hidden" name="sort" value="{{.SortField}}">
+          <input type="hidden" name="order" value="{{.SortOrder}}">
+          <div class="field">
+            <label for="auto_refresh_enabled">开关</label>
+            <label class="checkbox-field" for="auto_refresh_enabled">
+              <input id="auto_refresh_enabled" name="auto_refresh_enabled" type="checkbox" value="1" {{if .AutoRefreshEnabled}}checked{{end}}>
+              <span>每天自动刷新节点</span>
+            </label>
+          </div>
+          <div class="field">
+            <label for="auto_refresh_time">刷新时间</label>
+            <input id="auto_refresh_time" name="auto_refresh_time" type="time" value="{{.AutoRefreshTime}}" required>
+          </div>
+          <button class="btn btn-primary" type="submit" data-default-label="保存自动刷新设置" data-pending-label="保存中…">保存自动刷新设置</button>
+        </form>
+      </section>
+
       {{if .SupportsVPNControl}}
       <section class="card">
         <div class="toolbar" style="margin-bottom: 0;">
@@ -1131,6 +1160,48 @@
             window.location.reload();
           } catch (error) {
             const message = error instanceof Error ? error.message : '刷新失败，请稍后重试';
+            showToast(message, 'error');
+          } finally {
+            button.disabled = false;
+            button.textContent = defaultLabel;
+          }
+        });
+      });
+
+      document.querySelectorAll('.js-schedule-form').forEach((form) => {
+        form.addEventListener('submit', async (event) => {
+          event.preventDefault();
+
+          const button = form.querySelector('button[type="submit"]');
+          if (!button) return;
+
+          const defaultLabel = button.dataset.defaultLabel || button.textContent.trim();
+          const pendingLabel = button.dataset.pendingLabel || '保存中…';
+          const payload = new URLSearchParams(new FormData(form));
+
+          button.disabled = true;
+          button.textContent = pendingLabel;
+
+          try {
+            const response = await fetch(form.action, {
+              method: 'POST',
+              body: payload,
+              headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'fetch',
+              },
+            });
+            const data = await parseJSONSafe(response);
+
+            if (!response.ok || !data.ok) {
+              throw new Error(data.error || '保存自动刷新设置失败，请稍后重试');
+            }
+
+            rememberToast(data.notice || '自动刷新设置已保存', 'success');
+            window.location.reload();
+          } catch (error) {
+            const message = error instanceof Error ? error.message : '保存自动刷新设置失败，请稍后重试';
             showToast(message, 'error');
           } finally {
             button.disabled = false;

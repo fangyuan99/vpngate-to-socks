@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -72,7 +73,11 @@ type bypassRouteSpec struct {
 	Direct    bool
 }
 
-var testServerWithOpenVPN = vpngate.TestServerWithOpenVPN
+var (
+	testServerWithOpenVPN              = vpngate.TestServerWithOpenVPNOptions
+	resolveIPExecutableForRunner       = resolveIPExecutable
+	ensureBypassPolicyRoutingForRunner = ensureBypassPolicyRouting
+)
 
 func New(logger *log.Logger, socksListenAddr string, bypassCIDRs []string, autoConfig AutoPilotConfig) (*Runner, error) {
 	if logger == nil {
@@ -225,6 +230,9 @@ func (r *Runner) Connect(server vpngate.Server) error {
 	r.monitorFailureCount = 0
 	r.connectHandshakeSeen = false
 	r.connectTimeoutTriggered = false
+	r.originalGateway = ""
+	r.originalInterface = ""
+	r.localCIDRs = nil
 	r.logTail = r.logTail[:0]
 	r.mu.Unlock()
 
@@ -234,19 +242,22 @@ func (r *Runner) Connect(server vpngate.Server) error {
 		return err
 	}
 
-	if len(r.bypassCIDRs) > 0 || r.autoConfig.Enabled {
-		gateway, iface, err := discoverDefaultRoute()
-		if err != nil {
-			wrapped := fmt.Errorf("读取原始出口路由失败: %w", err)
+	gateway, iface, routeErr := discoverDefaultRoute()
+	if routeErr != nil {
+		r.logger.Printf("Runner 读取原始出口路由失败：%v", routeErr)
+		if len(r.bypassCIDRs) > 0 || r.autoConfig.Enabled {
+			wrapped := fmt.Errorf("读取原始出口路由失败: %w", routeErr)
 			r.fail(summary, wrapped.Error())
 			return wrapped
 		}
+	}
 
-		localCIDRs, err := discoverLocalCIDRs()
-		if err != nil {
-			r.logger.Printf("Runner 自动探测本地保留网段失败：%v", err)
-		}
+	localCIDRs, err := discoverLocalCIDRs()
+	if err != nil {
+		r.logger.Printf("Runner 自动探测本地保留网段失败：%v", err)
+	}
 
+	if routeErr == nil {
 		r.mu.Lock()
 		r.originalGateway = gateway
 		r.originalInterface = iface
@@ -390,7 +401,15 @@ func (r *Runner) canProxy() bool {
 
 func (r *Runner) TestServer(ctx context.Context, server vpngate.Server) (vpngate.OpenVPNTestResult, error) {
 	r.mu.Lock()
-	if r.proc != nil || r.state == StateConnecting || r.state == StateConnected || r.state == StateDisconnecting {
+	if r.state == StateConnecting || r.state == StateDisconnecting {
+		currentHost := "当前节点"
+		if r.current != nil && strings.TrimSpace(r.current.HostName) != "" {
+			currentHost = r.current.HostName
+		}
+		r.mu.Unlock()
+		return vpngate.OpenVPNTestResult{}, fmt.Errorf("当前已有活跃连接流程，请先结束 %s 后再测试其他节点", currentHost)
+	}
+	if r.proc != nil && r.state != StateConnected {
 		currentHost := "当前节点"
 		if r.current != nil && strings.TrimSpace(r.current.HostName) != "" {
 			currentHost = r.current.HostName
@@ -418,7 +437,13 @@ func (r *Runner) TestServer(ctx context.Context, server vpngate.Server) (vpngate
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	result, err := testServerWithOpenVPN(ctx, server)
+	options, err := r.openVPNTestOptions()
+	if err != nil {
+		r.logger.Printf("Runner 准备测试节点直连出口失败：%s（%s）：%v", server.HostName, server.IP, err)
+		return vpngate.OpenVPNTestResult{}, err
+	}
+
+	result, err := testServerWithOpenVPN(ctx, server, options)
 	if err != nil {
 		r.logger.Printf("Runner 测试节点失败：%s（%s）：%v", server.HostName, server.IP, err)
 		return vpngate.OpenVPNTestResult{}, err
@@ -663,6 +688,39 @@ func (r *Runner) setLastError(detail string) {
 	r.updatedAt = time.Now()
 }
 
+func (r *Runner) openVPNTestOptions() (vpngate.OpenVPNTestOptions, error) {
+	r.mu.RLock()
+	state := r.state
+	current := r.current
+	gateway := r.originalGateway
+	iface := r.originalInterface
+	autoConfig := r.autoConfig.withDefaults()
+	r.mu.RUnlock()
+
+	if state != StateConnected {
+		return vpngate.OpenVPNTestOptions{}, nil
+	}
+	if current == nil {
+		return vpngate.OpenVPNTestOptions{}, fmt.Errorf("当前 VPN 状态缺少连接节点信息，无法安全测试其他节点")
+	}
+	if runtime.GOOS != "linux" {
+		return vpngate.OpenVPNTestOptions{}, fmt.Errorf("当前系统暂不支持在已连接 VPN 时安全测试其他节点")
+	}
+	if strings.TrimSpace(gateway) == "" || strings.TrimSpace(iface) == "" {
+		return vpngate.OpenVPNTestOptions{}, fmt.Errorf("缺少原始出口路由信息，无法在保持当前连接时测试其他节点")
+	}
+
+	ipExecutable, err := resolveIPExecutableForRunner()
+	if err != nil {
+		return vpngate.OpenVPNTestOptions{}, err
+	}
+	if err := ensureBypassPolicyRoutingForRunner(ipExecutable, gateway, iface, autoConfig.BypassRouteTable, autoConfig.BypassMark); err != nil {
+		return vpngate.OpenVPNTestOptions{}, err
+	}
+
+	return vpngate.OpenVPNTestOptions{BypassMark: autoConfig.BypassMark}, nil
+}
+
 func (r *Runner) applyBypassRoutes() error {
 	r.mu.RLock()
 	bypassCIDRs := append([]string(nil), r.bypassCIDRs...)
@@ -683,13 +741,13 @@ func (r *Runner) applyBypassRoutes() error {
 		return fmt.Errorf("缺少原始网关或接口信息，无法应用局域网保留路由")
 	}
 
-	ipExecutable, err := resolveIPExecutable()
+	ipExecutable, err := resolveIPExecutableForRunner()
 	if err != nil {
 		return err
 	}
 
 	if autoConfig.Enabled {
-		if err := ensureBypassPolicyRouting(ipExecutable, gateway, iface, autoConfig.BypassRouteTable, autoConfig.BypassMark); err != nil {
+		if err := ensureBypassPolicyRoutingForRunner(ipExecutable, gateway, iface, autoConfig.BypassRouteTable, autoConfig.BypassMark); err != nil {
 			return err
 		}
 	}

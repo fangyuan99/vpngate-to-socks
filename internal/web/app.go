@@ -30,12 +30,16 @@ type App struct {
 	tmpl   *template.Template
 	runner RunnerControl
 
+	refreshMu           sync.Mutex
 	mu                  sync.RWMutex
 	servers             []vpngate.Server
 	lastUpdated         time.Time
 	lastRefreshDuration time.Duration
 	lastError           string
 	testResults         map[string]serverTestState
+	configPath          string
+	config              webConfig
+	autoRefreshWakeCh   chan struct{}
 }
 
 type RunnerControl interface {
@@ -88,6 +92,11 @@ type PageData struct {
 	AutoReconnectStatusText      string
 	AutoReconnectStatusClass     string
 	AutoReconnectStatusDetail    string
+	AutoRefreshEnabled           bool
+	AutoRefreshTime              string
+	AutoRefreshStatusText        string
+	AutoRefreshStatusClass       string
+	AutoRefreshStatusDetail      string
 }
 
 type CountryOption struct {
@@ -166,12 +175,21 @@ func NewApp(logger *log.Logger, client *http.Client, runnerClient RunnerControl)
 		return nil, fmt.Errorf("加载 HTML 模板失败: %w", err)
 	}
 
+	configPath := webConfigPathFromEnv()
+	config, err := loadWebConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+
 	return &App{
-		client:      client,
-		logger:      logger,
-		tmpl:        tmpl,
-		runner:      runnerClient,
-		testResults: make(map[string]serverTestState),
+		client:            client,
+		logger:            logger,
+		tmpl:              tmpl,
+		runner:            runnerClient,
+		testResults:       make(map[string]serverTestState),
+		configPath:        configPath,
+		config:            config,
+		autoRefreshWakeCh: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -179,6 +197,7 @@ func (a *App) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/refresh", a.handleRefresh)
+	mux.HandleFunc("/refresh/schedule", a.handleRefreshSchedule)
 	mux.HandleFunc("/servers/test", a.handleServerTest)
 	mux.HandleFunc("/vpn/connect/recommended", a.handleVPNConnectRecommended)
 	mux.HandleFunc("/vpn/connect", a.handleVPNConnect)
@@ -196,6 +215,9 @@ func (a *App) Refresh(ctx context.Context) error {
 }
 
 func (a *App) refreshServers(ctx context.Context) ([]vpngate.Server, error) {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+
 	a.logger.Println("开始刷新 VPNGate 节点列表……")
 	start := time.Now()
 
@@ -289,6 +311,65 @@ func (a *App) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
+}
+
+func (a *App) handleRefreshSchedule(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		a.writeActionError(w, r, http.StatusMethodNotAllowed, "仅支持 POST 请求")
+		return
+	}
+
+	if err := validateSameOriginRequest(r); err != nil {
+		a.writeActionError(w, r, http.StatusForbidden, err.Error())
+		return
+	}
+
+	if err := parseSubmittedForm(r); err != nil {
+		a.writeActionError(w, r, http.StatusBadRequest, "读取表单失败")
+		return
+	}
+
+	query := strings.TrimSpace(r.FormValue("q"))
+	selectedCountry := strings.TrimSpace(r.FormValue("country"))
+	sortField := strings.TrimSpace(r.FormValue("sort"))
+	sortOrder := strings.TrimSpace(r.FormValue("order"))
+
+	nextConfig := a.currentWebConfig()
+	nextConfig.AutoRefresh.Enabled = r.FormValue("auto_refresh_enabled") != ""
+	nextConfig.AutoRefresh.Time = strings.TrimSpace(r.FormValue("auto_refresh_time"))
+	if nextConfig.AutoRefresh.Time == "" {
+		nextConfig.AutoRefresh.Time = defaultAutoRefreshTime
+	}
+
+	respond := func(statusCode int, ok bool, notice, flashError string) {
+		if wantsJSONResponse(r) {
+			a.writeJSON(w, statusCode, actionResponse{OK: ok, Notice: notice, Error: flashError, Reload: ok})
+			return
+		}
+
+		http.Redirect(w, r, buildIndexURL(notice, flashError, query, selectedCountry, sortField, sortOrder), http.StatusSeeOther)
+	}
+
+	if err := validateWebConfig(nextConfig); err != nil {
+		respond(http.StatusBadRequest, false, "", err.Error())
+		return
+	}
+	if err := saveWebConfig(a.configPath, nextConfig); err != nil {
+		respond(http.StatusInternalServerError, false, "", fmt.Sprintf("保存自动刷新设置失败：%v", err))
+		return
+	}
+
+	a.mu.Lock()
+	a.config = nextConfig
+	a.mu.Unlock()
+	a.notifyAutoRefreshChanged()
+
+	if !nextConfig.AutoRefresh.Enabled {
+		respond(http.StatusOK, true, "自动刷新已关闭", "")
+		return
+	}
+
+	respond(http.StatusOK, true, fmt.Sprintf("自动刷新已启用：每天 %s 刷新节点列表", nextConfig.AutoRefresh.Time), "")
 }
 
 func (a *App) handleServerTest(w http.ResponseWriter, r *http.Request) {
@@ -706,6 +787,7 @@ func (a *App) buildPageData(notice, flashError, query, selectedCountry, sortFiel
 	lastUpdated := a.lastUpdated
 	lastRefreshDuration := a.lastRefreshDuration
 	lastError := a.lastError
+	config := a.config
 	testResults := make(map[string]serverTestState, len(a.testResults))
 	maps.Copy(testResults, a.testResults)
 	a.mu.RUnlock()
@@ -801,6 +883,7 @@ func (a *App) buildPageData(notice, flashError, query, selectedCountry, sortFiel
 		statusText = "上次刷新失败"
 		statusClass = "status-warn"
 	}
+	autoRefreshText, autoRefreshClass, autoRefreshDetail := formatAutoRefreshStatus(config.AutoRefresh)
 
 	updatedAt := "尚未刷新"
 	lastUpdatedReadable := "暂无可用数据"
@@ -850,6 +933,11 @@ func (a *App) buildPageData(notice, flashError, query, selectedCountry, sortFiel
 		AutoReconnectStatusText:      autoReconnectText,
 		AutoReconnectStatusClass:     autoReconnectClass,
 		AutoReconnectStatusDetail:    autoReconnectDetail,
+		AutoRefreshEnabled:           config.AutoRefresh.Enabled,
+		AutoRefreshTime:              safeText(config.AutoRefresh.Time, defaultAutoRefreshTime),
+		AutoRefreshStatusText:        autoRefreshText,
+		AutoRefreshStatusClass:       autoRefreshClass,
+		AutoRefreshStatusDetail:      autoRefreshDetail,
 	}
 }
 
@@ -1129,6 +1217,15 @@ func formatAutoReconnectStatus(status runner.Status, runnerErr error) (string, s
 	}
 
 	return "自动重连已启用", "status-ok", detail + " ｜ 断联后会自动选择当前范围内的最优节点重连"
+}
+
+func formatAutoRefreshStatus(config autoRefreshConfig) (string, string, string) {
+	refreshTime := safeText(config.Time, defaultAutoRefreshTime)
+	if !config.Enabled {
+		return "自动刷新已关闭", "status-warn", fmt.Sprintf("开启后会按 Web 服务本地时区每天 %s 自动刷新节点列表。", refreshTime)
+	}
+
+	return "自动刷新已启用", "status-ok", fmt.Sprintf("每天 %s 自动刷新节点列表；刷新只更新 Web 节点缓存，不会断开当前 VPN。", refreshTime)
 }
 
 func matchesFilters(server vpngate.Server, query, selectedCountry string) bool {

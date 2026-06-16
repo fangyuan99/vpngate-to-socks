@@ -34,6 +34,7 @@ var allowedOpenVPNDirectives = map[string]struct{}{
 	"comp-lzo":        {},
 	"compress":        {},
 	"connect-timeout": {},
+	"data-ciphers":    {},
 	"dev":             {},
 	"float":           {},
 	"key-direction":   {},
@@ -76,10 +77,18 @@ type OpenVPNTestResult struct {
 	Detail   string
 }
 
+type OpenVPNTestOptions struct {
+	BypassMark int
+}
+
 // TestServerWithOpenVPN writes the embedded OpenVPN config to a temporary file,
 // starts the local openvpn client, and treats a completed initialization sequence
 // as a successful test. The process is terminated immediately after success.
 func TestServerWithOpenVPN(ctx context.Context, server Server) (OpenVPNTestResult, error) {
+	return TestServerWithOpenVPNOptions(ctx, server, OpenVPNTestOptions{})
+}
+
+func TestServerWithOpenVPNOptions(ctx context.Context, server Server, options OpenVPNTestOptions) (OpenVPNTestResult, error) {
 	launchConfig, err := PrepareOpenVPNLaunch(server)
 	if err != nil {
 		return OpenVPNTestResult{}, err
@@ -100,7 +109,7 @@ func TestServerWithOpenVPN(ctx context.Context, server Server) (OpenVPNTestResul
 		return OpenVPNTestResult{}, fmt.Errorf("关闭临时 OpenVPN 配置文件失败: %w", err)
 	}
 
-	return runOpenVPNTest(ctx, launchConfig.Executable, tmpFile.Name(), launchConfig.Cipher)
+	return runOpenVPNTest(ctx, launchConfig.Executable, tmpFile.Name(), launchConfig.Cipher, options)
 }
 
 // PrepareOpenVPNLaunch decodes and sanitizes a VPN Gate OpenVPN configuration,
@@ -135,11 +144,15 @@ func PrepareOpenVPNLaunch(server Server) (OpenVPNLaunchConfig, error) {
 // BuildOpenVPNTestArgs returns conservative short-lived arguments suitable for
 // connectivity testing without keeping the tunnel active.
 func BuildOpenVPNTestArgs(configPath, cipher string) []string {
+	return BuildOpenVPNTestArgsWithOptions(configPath, cipher, OpenVPNTestOptions{})
+}
+
+func BuildOpenVPNTestArgsWithOptions(configPath, cipher string, options OpenVPNTestOptions) []string {
 	if strings.TrimSpace(cipher) == "" {
 		cipher = openVPNDefaultCipher
 	}
 
-	return []string{
+	args := []string{
 		"--verb", "4",
 		"--config", configPath,
 		"--script-security", "2",
@@ -148,6 +161,11 @@ func BuildOpenVPNTestArgs(configPath, cipher string) []string {
 		"--route-nopull",
 		"--data-ciphers", cipher,
 	}
+	if options.BypassMark > 0 {
+		args = append(args, "--mark", fmt.Sprintf("%d", options.BypassMark))
+	}
+
+	return args
 }
 
 // BuildOpenVPNConnectArgs returns arguments for a real long-lived VPN
@@ -180,6 +198,7 @@ func sanitizeOpenVPNConfig(raw string) (string, string, error) {
 	seenCert := false
 	seenKey := false
 	var cipher string
+	var dataCiphers string
 
 	for i := 0; i < len(lines); i++ {
 		trimmed := strings.TrimSpace(lines[i])
@@ -243,6 +262,10 @@ func sanitizeOpenVPNConfig(raw string) (string, string, error) {
 			if len(fields) > 1 {
 				cipher = fields[1]
 			}
+		case "data-ciphers":
+			if len(fields) > 1 {
+				dataCiphers = fields[1]
+			}
 		}
 
 		output = append(output, trimmed)
@@ -258,6 +281,10 @@ func sanitizeOpenVPNConfig(raw string) (string, string, error) {
 
 	if !seenCA || !seenCert || !seenKey {
 		return "", "", fmt.Errorf("OpenVPN 配置缺少必要的证书块信息")
+	}
+
+	if dataCiphers != "" {
+		cipher = dataCiphers
 	}
 
 	return strings.Join(output, "\n") + "\n", cipher, nil
@@ -292,8 +319,8 @@ func resolveOpenVPNExecutable() (string, error) {
 	return "", fmt.Errorf("未找到 openvpn 可执行文件，请先安装 OpenVPN，并确保当前服务可访问该命令")
 }
 
-func runOpenVPNTest(ctx context.Context, executable, configPath, cipher string) (OpenVPNTestResult, error) {
-	args := BuildOpenVPNTestArgs(configPath, cipher)
+func runOpenVPNTest(ctx context.Context, executable, configPath, cipher string, options OpenVPNTestOptions) (OpenVPNTestResult, error) {
+	args := BuildOpenVPNTestArgsWithOptions(configPath, cipher, options)
 	cmd := exec.CommandContext(ctx, executable, args...)
 	reader, writer := io.Pipe()
 	defer reader.Close()

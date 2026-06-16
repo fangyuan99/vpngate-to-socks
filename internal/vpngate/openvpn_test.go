@@ -56,6 +56,28 @@ func TestSanitizeOpenVPNConfig(t *testing.T) {
 	}
 }
 
+func TestSanitizeOpenVPNConfigAllowsDataCiphers(t *testing.T) {
+	config := strings.Replace(
+		sampleOpenVPNConfig,
+		"cipher AES-128-CBC\n",
+		"cipher AES-128-CBC\ndata-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC\n",
+		1,
+	)
+
+	sanitized, cipher, err := sanitizeOpenVPNConfig(config)
+	if err != nil {
+		t.Fatalf("sanitizeOpenVPNConfig() error = %v", err)
+	}
+
+	if cipher != "AES-256-GCM:AES-128-GCM:AES-128-CBC" {
+		t.Fatalf("cipher = %q, want %q", cipher, "AES-256-GCM:AES-128-GCM:AES-128-CBC")
+	}
+
+	if !strings.Contains(sanitized, "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC") {
+		t.Fatal("sanitized config should contain data-ciphers")
+	}
+}
+
 func TestSanitizeOpenVPNConfigRejectsUnsafeDirective(t *testing.T) {
 	unsafeConfig := sampleOpenVPNConfig + "up /tmp/test.sh\n"
 
@@ -82,6 +104,12 @@ func TestBuildOpenVPNTestArgsIncludesFastFailTimeout(t *testing.T) {
 
 	assertArgValue(t, args, "--connect-timeout", "10")
 	assertArgValue(t, args, "--connect-retry-max", "3")
+}
+
+func TestBuildOpenVPNTestArgsIncludesBypassMarkWhenRequested(t *testing.T) {
+	args := BuildOpenVPNTestArgsWithOptions("/tmp/example.ovpn", "", OpenVPNTestOptions{BypassMark: 7})
+
+	assertArgValue(t, args, "--mark", "7")
 }
 
 func assertArgValue(t *testing.T, args []string, key, value string) {

@@ -1,6 +1,7 @@
 bin/
 dist/
 tmp/
+data/
 coverage.out
 *.test
 .DS_Store

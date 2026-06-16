@@ -13,8 +13,11 @@ services:
     environment:
       PORT: "8080"
       RUNNER_API_URL: "http://vpngate-runner:18081"
+      WEB_CONFIG_PATH: "/app/data/web-config.json"
     ports:
       - "8082:8080"
+    volumes:
+      - ./data:/app/data
     depends_on:
       - vpngate-runner
     command: ["/usr/local/bin/vpngate-web"]

@@ -211,6 +211,7 @@ gofmt -l .
 | --- | --- | --- |
 | `PORT` | `8080` | Web 服务监听端口 |
 | `RUNNER_API_URL` | `http://127.0.0.1:18081` | Runner 控制接口地址 |
+| `WEB_CONFIG_PATH` | `data/web-config.json` | Web 页面配置文件路径，用于保存每日自动刷新开关和时间 |
 
 ### Runner 服务
 
@@ -246,6 +247,7 @@ AUTO_CONNECT=false MONITOR_INTERVAL=15s docker compose -f docker-compose.macos.y
 
 - `GET /health`：健康检查
 - `POST /refresh`：刷新节点列表
+- `POST /refresh/schedule`：保存每日自动刷新设置
 
 ### Runner
 
@@ -259,6 +261,8 @@ AUTO_CONNECT=false MONITOR_INTERVAL=15s docker compose -f docker-compose.macos.y
 
 - 节点数据来自上游 VPN Gate API：`https://www.vpngate.net/api/iphone/`
 - 首次启动时会自动刷新一次节点列表；如果失败，服务仍会继续启动
+- Web 页面可开启每日自动刷新并选择刷新时间；该刷新只更新 Web 节点缓存，不会断开 Runner 当前连接
+- Docker Compose 默认把 `./data` 挂载到 Web 容器 `/app/data`，用于持久保存 `WEB_CONFIG_PATH` 指向的页面配置
 - 节点测试和持久连接依赖 `openvpn`
 - Docker 场景下，Runner 需要 `privileged` / `NET_ADMIN` 等网络能力
 - macOS Docker Desktop 场景依赖 Linux VM 的网络能力，不等同于直接控制 macOS 宿主机网络

@@ -17,11 +17,14 @@ func main() {
 	logger := log.New(os.Stdout, "[VPNGate] ", log.LstdFlags)
 	port := serverPort()
 	runnerClient := runnerclient.New(runnerAPIURL(), nil)
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	defer runtimeCancel()
 
 	app, err := web.NewApp(logger, nil, runnerClient)
 	if err != nil {
 		logger.Fatalf("初始化页面服务失败：%v", err)
 	}
+	app.Start(runtimeCtx)
 
 	startupCtx, startupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer startupCancel()
@@ -50,6 +53,7 @@ func main() {
 	<-sigCh
 
 	logger.Println("收到停止信号，正在关闭服务……")
+	runtimeCancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

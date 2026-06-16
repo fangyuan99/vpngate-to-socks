@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -182,6 +184,137 @@ func TestHandleAutoReconnectUpdatesRunnerConfig(t *testing.T) {
 	}
 	if !strings.Contains(response.Notice, "自动重连已启用") {
 		t.Fatalf("notice = %q, want substring %q", response.Notice, "自动重连已启用")
+	}
+}
+
+func TestLoadWebConfigUsesDefaultWhenMissing(t *testing.T) {
+	config, err := loadWebConfig(filepath.Join(t.TempDir(), "missing.json"))
+	if err != nil {
+		t.Fatalf("loadWebConfig() error = %v", err)
+	}
+
+	if config.AutoRefresh.Enabled {
+		t.Fatal("AutoRefresh.Enabled = true, want false")
+	}
+	if config.AutoRefresh.Time != defaultAutoRefreshTime {
+		t.Fatalf("AutoRefresh.Time = %q, want %q", config.AutoRefresh.Time, defaultAutoRefreshTime)
+	}
+}
+
+func TestSaveWebConfigWritesValidConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "web-config.json")
+	config := webConfig{AutoRefresh: autoRefreshConfig{Enabled: true, Time: "04:30"}}
+
+	if err := saveWebConfig(path, config); err != nil {
+		t.Fatalf("saveWebConfig() error = %v", err)
+	}
+
+	loaded, err := loadWebConfig(path)
+	if err != nil {
+		t.Fatalf("loadWebConfig() error = %v", err)
+	}
+	if loaded.AutoRefresh != config.AutoRefresh {
+		t.Fatalf("loaded AutoRefresh = %#v, want %#v", loaded.AutoRefresh, config.AutoRefresh)
+	}
+}
+
+func TestSaveWebConfigRejectsInvalidAutoRefreshTime(t *testing.T) {
+	err := saveWebConfig(filepath.Join(t.TempDir(), "web-config.json"), webConfig{
+		AutoRefresh: autoRefreshConfig{Enabled: true, Time: "24:00"},
+	})
+	if err == nil {
+		t.Fatal("saveWebConfig() error = nil, want validation error")
+	}
+	if !strings.Contains(err.Error(), "HH:MM") {
+		t.Fatalf("saveWebConfig() error = %v, want HH:MM validation", err)
+	}
+}
+
+func TestHandleRefreshScheduleUpdatesConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "web-config.json")
+	t.Setenv(webConfigPathEnvVar, configPath)
+
+	app, err := NewApp(log.New(io.Discard, "", 0), nil, nil)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	form := url.Values{
+		"auto_refresh_enabled": []string{"1"},
+		"auto_refresh_time":    []string{"05:45"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/refresh/schedule", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("Accept", "application/json")
+
+	recorder := httptest.NewRecorder()
+	app.handleRefreshSchedule(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("handleRefreshSchedule() status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var response actionResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if !response.OK {
+		t.Fatalf("response.OK = false, error = %q", response.Error)
+	}
+
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !strings.Contains(string(contents), `"time": "05:45"`) {
+		t.Fatalf("saved config = %s, want time 05:45", string(contents))
+	}
+}
+
+func TestRunAutoRefreshRefreshesServersWithoutRunnerControl(t *testing.T) {
+	var fetchCalls atomic.Int32
+	var connectCalls atomic.Int32
+	var disconnectCalls atomic.Int32
+	runnerStub := &stubRunnerControl{
+		enabled: true,
+		connect: func(ctx context.Context, server vpngate.Server) (runner.Status, error) {
+			connectCalls.Add(1)
+			return runner.Status{}, nil
+		},
+		disconnect: func(ctx context.Context) (runner.Status, error) {
+			disconnectCalls.Add(1)
+			return runner.Status{}, nil
+		},
+	}
+
+	app, err := NewApp(
+		log.New(io.Discard, "", 0),
+		&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			fetchCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(latestListResponse("auto-node", "9.9.9.9", 100))),
+				Request:    req,
+			}, nil
+		})},
+		runnerStub,
+	)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	app.runAutoRefresh(context.Background())
+
+	if fetchCalls.Load() != 1 {
+		t.Fatalf("fetch calls = %d, want 1", fetchCalls.Load())
+	}
+	if connectCalls.Load() != 0 {
+		t.Fatalf("connect calls = %d, want 0", connectCalls.Load())
+	}
+	if disconnectCalls.Load() != 0 {
+		t.Fatalf("disconnect calls = %d, want 0", disconnectCalls.Load())
 	}
 }
 
